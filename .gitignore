@@ -3,3 +3,6 @@
 .ijwb/
 .lsp/
 bazel-*
+user.bazelrc
+MODULE.bazel
+MODULE.bazel.lock
