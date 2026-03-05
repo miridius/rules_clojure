@@ -34,7 +34,7 @@ bazel build //src/rules_clojure:libfs         # Compiled filesystem utilities
 bazel build //src/rules_clojure:libworker     # Compiled worker library
 bazel build //src/rules_clojure:gen_build     # BUILD file generator binary
 
-# Build everything (note: //test/... has a pre-existing failure, see Known Issues)
+# Build everything
 bazel build //...
 ```
 
@@ -53,10 +53,6 @@ bazel test //test/rules_clojure:persistent-classloader-test
 cd examples/simple && bazel test //...
 cd examples/stress && bazel test //...
 ```
-
-## Known Issues
-
-- **test-utils AOT compilation failure**: The `//test/rules_clojure:test-utils` target fails during AOT compilation because the worker can't find source for `rules-clojure.fs` (the `libfs.jar` contains only compiled classes, no source). This is a **pre-existing issue on the main branch** and blocks all test targets since they transitively depend on `test-utils`. The REPL target (`//:repl`) is also affected.
 
 ## Project Structure
 
