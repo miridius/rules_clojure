@@ -32,7 +32,9 @@ java_library(
                "tools/reader/impl/utils.clj",
                "persistent_classloader.clj",
                "persistentClassLoader.clj",
-               "util.clj"],
+               "util.clj",
+               "benchmark.clj",
+               "bootstrap_benchmark.clj"],
 
     resource_strip_prefix="src",
     runtime_deps=["@rules_clojure_maven_deps//:org_clojure_clojure",
@@ -135,6 +137,29 @@ java_binary(name="gen_build",
 java_library(name="srcjar",
              resources=glob(["*.clj"]),
              resource_strip_prefix="src")
+
+genrule(
+    name="bootstrap-benchmark",
+    tools=[":bootstrap-bin"],
+    cmd="""
+    mkdir -p benchmark-classes
+    $(location :bootstrap-bin) -m rules-clojure.bootstrap-benchmark $(location :libbenchmark.jar)
+    """,
+    outs=["libbenchmark.jar"])
+
+java_import(name="libbenchmark",
+            jars=["libbenchmark.jar"],
+            runtime_deps = ["@rules_clojure_maven_deps//:org_clojure_clojure",
+                            "@rules_clojure_maven_deps//:org_clojure_spec_alpha",
+                            "@rules_clojure_maven_deps//:org_clojure_core_specs_alpha",
+                            "@rules_clojure_maven_deps//:org_clojure_tools_deps",
+                            ":libfs"],
+            data=[":bootstrap-benchmark"])
+
+java_binary(name="benchmark",
+            main_class="rules_clojure.benchmark",
+            runtime_deps=[":libbenchmark"],
+            jvm_flags = ["-Xmx500m", "-XX:MaxMetaspaceSize=500m"])
 
 ## files needed for the clj toolchain
 filegroup(name="toolchain_files",
