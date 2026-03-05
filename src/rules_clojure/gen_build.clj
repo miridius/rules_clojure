@@ -14,7 +14,7 @@
             [rules-clojure.namespace.parse :as parse])
   (:import (clojure.lang IPersistentList IPersistentMap IPersistentVector Keyword Var)
            (java.io File)
-           (java.nio.file Path)
+           (java.nio.file FileVisitOption Files Path)
            (java.util.jar JarEntry JarFile))
   (:gen-class))
 
@@ -56,10 +56,16 @@
   (throw-if-not! (seq coll) "no first in coll" {:coll coll})
   (first coll))
 
+(def ^:dynamic *enable-validation*
+  "Set to true to enable spec validation in hot paths. Default false for performance."
+  false)
+
 (defn validate! [spec val]
-  (if (s/valid? spec val)
-    val
-    (throw (ex-info "value does not conform" (s/explain-data spec val)))))
+  (if *enable-validation*
+    (if (s/valid? spec val)
+      val
+      (throw (ex-info "value does not conform" (s/explain-data spec val))))
+    val))
 
 (defn emit-bazel-dispatch [x]
   (class x))
@@ -387,19 +393,44 @@
     (when label
       {:deps [label]})))
 
+(def ^:private ^java.util.concurrent.ConcurrentHashMap file-content-cache
+  "Cache of file path -> file content string, to avoid repeated slurps."
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(def ^:private ^java.util.concurrent.ConcurrentHashMap ns-decl-cache
+  "Cache of [file-path platform] -> ns-decl-form (boxed in [result] to distinguish nil from missing)."
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn clear-file-cache!
+  "Clear the file content and ns-decl caches. Call between benchmark iterations if needed."
+  []
+  (.clear file-content-cache)
+  (.clear ns-decl-cache))
+
+(defn- slurp-cached ^String [^Path path]
+  (or (.get file-content-cache path)
+      (let [s (slurp (.toFile path))]
+        (.putIfAbsent file-content-cache path s)
+        s)))
+
 (defn get-ns-decl [^Path path platform]
-  (try
-    (let [form (-> path
-                  (.toFile)
-                  (slurp)
-                  (#(read-string {:read-cond :allow
-                                  :features #{platform}} %)))]
-     ;; the first form might not be `ns`, in which case ignore the file
-     (when (and form (= 'ns (first form)))
-       form))
-    (catch Exception e
-      (throw (ex-info (str "while reading" path) {:path path
-                                                  :platform platform} e)))))
+  (let [cache-key [path platform]
+        cached (.get ns-decl-cache cache-key)]
+    (if cached
+      (first cached)
+      (let [result (try
+                     (let [content (slurp-cached path)
+                           form (read-string {:read-cond :allow
+                                              :features #{platform}} content)]
+                       ;; the first form might not be `ns`, in which case ignore the file
+                       (when (and form (= 'ns (first form)))
+                         form))
+                     (catch Exception e
+                       (throw (ex-info (str "while reading " path) {:path path
+                                                                    :platform platform} e))))]
+        (.putIfAbsent ns-decl-cache cache-key [result])
+        result))))
+
 
 (defn get-ns-meta
   "return any metadata attached to the namespace, or nil"
@@ -467,21 +498,22 @@
 
 (s/fdef clj-path? :args (s/cat :p fs/path?) :ret boolean?)
 (defn clj-path? [path]
-  (boolean (re-find #"\.clj$" (str path))))
+  (.endsWith (str path) ".clj"))
 
 (defn cljc-path? [path]
-  (boolean (re-find #"\.cljc$" (str path))))
+  (.endsWith (str path) ".cljc"))
 
 (defn cljs-path? [path]
-  (boolean (re-find #"\.cljs$" (str path))))
+  (.endsWith (str path) ".cljs"))
 
 (defn clj*-path? [path]
-  (or (clj-path? path)
-      (cljc-path? path)
-      (cljs-path? path)))
+  (let [s (str path)]
+    (or (.endsWith s ".clj")
+        (.endsWith s ".cljc")
+        (.endsWith s ".cljs"))))
 
 (defn js-path? [path]
-  (re-find #"\.js$" (str path)))
+  (.endsWith (str path) ".js"))
 
 (defn test-path? [path]
   (boolean (re-find #"_test.clj" (str path))))
@@ -551,7 +583,6 @@
   "given a .clj path, return all rules for the file "
   [{:keys [basis deps-bazel deps-repo-tag deps-edn-dir] :as args} paths]
   (assert (map? (:src-ns->label args)))
-  (assert (s/valid? (s/coll-of fs/path?) paths))
   (try
     (let [clj? (some clj-path? paths)
           cljs? (some cljs-path? paths)
@@ -641,23 +672,28 @@
 
 (s/fdef gen-dir :args (s/cat :a (s/keys :req-un [::deps-edn-dir ::basis ::jar->lib ::deps-repo-tag]) :f fs/path?))
 (defn gen-dir
-  "given a source directory, write a BUILD.bazel for all .clj files in the directory. non-recursive"
-  [{:keys [deps-edn-dir] :as args} dir]
+  "given a source directory, write a BUILD.bazel for all .clj files in the directory. non-recursive.
+  When :dirs-with-clj is provided in args (a set of directory paths that contain clj files),
+  it is used to determine clj-subdirs without redundant recursive ls-r scans."
+  [{:keys [deps-edn-dir dirs-with-clj] :as args} dir]
   (assert (map? (:src-ns->label args)))
-  (let [paths (->> (fs/ls dir)
+  (let [dir-entries (fs/ls dir)
+        paths (->> dir-entries
                    (filter (fn [p]
                              (or (clj*-path? p)
                                  (js-path? p))))
                    (sort-by str))
-        subdirs (->> dir
-                     fs/ls
+        subdirs (->> dir-entries
                      (filter (fn [^Path p]
                                (-> p .toFile fs/directory?)))
                      (sort-by str))
-        clj-subdirs (->>
-                     subdirs
-                     (filter (fn [p]
-                               (some clj*-path? (seq (fs/ls-r p))))))
+        clj-subdirs (if dirs-with-clj
+                      ;; Fast path: use pre-computed set of dirs that have clj files
+                      (filter dirs-with-clj subdirs)
+                      ;; Slow path: recursively scan each subdir (original behavior)
+                      (->> subdirs
+                           (filter (fn [p]
+                                     (some clj*-path? (seq (fs/ls-r p)))))))
         rules (->> paths
                    (group-by fs/basename)
                    (mapcat (fn [[_base paths]]
@@ -693,20 +729,65 @@
         fs/path->file
         (spit content :encoding "UTF-8"))))
 
+(defn- source-file-path?
+  "Returns true if the path has a clj/cljc/cljs/js extension."
+  [^Path p]
+  (let [s (str (.getFileName p))]
+    (or (.endsWith s ".clj")
+        (.endsWith s ".cljc")
+        (.endsWith s ".cljs")
+        (.endsWith s ".js"))))
+
+(defn- collect-dirs-with-clj-files
+  "Walk source paths once using java.nio Files/walk, returning:
+   {:all-dirs   - set of all directories containing clj/cljc/cljs/js files
+    :dirs-with-clj - set of directories that transitively contain clj files (for clj-subdirs check)
+    :source-files  - vector of all source file paths found}"
+  [paths]
+  (let [all-files (java.util.ArrayList.)
+        _ (doseq [path paths]
+            (when (-> ^Path path .toFile .isDirectory)
+              (let [stream (java.nio.file.Files/walk path (into-array java.nio.file.FileVisitOption []))]
+                (try
+                  (.. stream
+                      (forEach (reify java.util.function.Consumer
+                                 (accept [_ p]
+                                   (.add all-files p)))))
+                  (finally
+                    (.close stream))))))
+        clj-files (filterv source-file-path? all-files)
+        ;; Directories that directly contain source files
+        dirs-with-files (->> clj-files
+                             (map fs/dirname)
+                             (into #{}))
+        ;; For clj-subdirs check: a dir is a "clj dir" if it or any descendant has clj files
+        ;; We propagate up from each dir-with-files to all ancestor dirs
+        dirs-with-clj (into #{} (mapcat (fn [^Path dir]
+                                          (loop [d dir
+                                                 acc [dir]]
+                                            (let [parent (.getParent d)]
+                                              (if parent
+                                                (recur parent (conj acc parent))
+                                                acc)))))
+                            dirs-with-files)]
+    {:all-dirs dirs-with-files
+     :dirs-with-clj dirs-with-clj
+     :source-files clj-files}))
+
 (s/fdef gen-source-paths- :args (s/cat :a (s/keys :req-un [::deps-edn-dir ::src-ns->label ::dep-ns->label ::jar->lib ::deps-repo-tag ::deps-bazel]) :paths (s/coll-of fs/path?)))
 (defn gen-source-paths-
   "gen-dir for every directory on the classpath."
   [args paths]
   (assert (map? (:src-ns->label args)))
-  (->> paths
-       (mapcat (fn [path]
-                 (fs/ls-r path)))
-       (map fs/dirname)
-       (distinct)
-       (sort-by (comp count str))
-       (reverse)
-       (prun (fn [dir]
-               (gen-dir args dir)))))
+  (let [{:keys [all-dirs dirs-with-clj]} (collect-dirs-with-clj-files paths)
+        args (assoc args :dirs-with-clj dirs-with-clj)
+        dirs (->> all-dirs
+                  (sort-by (comp count str))
+                  (reverse))]
+    (clear-file-cache!)
+    (prun (fn [dir]
+            (gen-dir args dir))
+          dirs)))
 
 (defn path->absolute
   [path deps-edn-path]

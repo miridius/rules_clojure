@@ -132,7 +132,7 @@ java_binary(name="worker",
 java_binary(name="gen_build",
             main_class="rules_clojure.gen_build",
             runtime_deps=[":libgen_build"],
-            jvm_flags = ["-Xmx500m", "-XX:MaxMetaspaceSize=500m"])
+            jvm_flags = ["-Xmx2g", "-XX:MaxMetaspaceSize=500m"])
 
 java_library(name="srcjar",
              resources=glob(["*.clj"]),
@@ -159,7 +159,7 @@ java_import(name="libbenchmark",
 java_binary(name="benchmark",
             main_class="rules_clojure.benchmark",
             runtime_deps=[":libbenchmark"],
-            jvm_flags = ["-Xmx500m", "-XX:MaxMetaspaceSize=500m"])
+            jvm_flags = ["-Xmx2g", "-XX:MaxMetaspaceSize=500m"])
 
 ## files needed for the clj toolchain
 filegroup(name="toolchain_files",

@@ -95,6 +95,54 @@
       (alter-var-root v (constantly orig))))
   (reset! originals {}))
 
+;; -- Synthetic basis for offline benchmarking ---------------------------------
+
+(defn- make-synthetic-basis
+  "Construct a minimal basis map for benchmarking without network access.
+  The basis only needs :classpath (with path-key entries for source dirs)
+  and :paths for source-paths to work."
+  [deps-edn-path src-dir]
+  (let [deps-edn-dir (fs/dirname deps-edn-path)
+        src-path (fs/->path src-dir)
+        rel-path (str (fs/path-relative-to deps-edn-dir src-path))]
+    {:classpath {src-path {:path-key rel-path}}
+     :classpath-roots [src-path]
+     :paths [rel-path]}))
+
+(defn bench-gen-source-paths
+  "Benchmark gen-source-paths- directly, bypassing tools.deps resolution.
+  This is the core of what we want to optimize."
+  [{:keys [deps-edn-path src-dir]}]
+  (let [deps-edn-path (-> deps-edn-path fs/->path fs/absolute)
+        src-dir (-> src-dir fs/->path fs/absolute)
+        deps-edn-dir (fs/dirname deps-edn-path)
+        basis (make-synthetic-basis deps-edn-path src-dir)
+        ;; Build src-ns->label by scanning source dirs
+        src-ns->label (->> (find/find-namespaces [(fs/path->file src-dir)] find/clj)
+                           (map (fn [n]
+                                  (let [src-location (gen-build/resolve-src-location src-dir n)]
+                                    [n (str "/" (fs/path-relative-to deps-edn-dir (fs/dirname src-location))
+                                            ":" (str (fs/basename src-location)))])))
+                           (into {}))
+        args {:aliases []
+              :deps-bazel {}
+              :deps-edn-path deps-edn-path
+              :deps-edn-dir deps-edn-dir
+              :deps-repo-tag "@deps"
+              :basis basis
+              :jar->lib {}
+              :class->jar {}
+              :src-ns->label src-ns->label
+              :dep-ns->label {:clj {} :cljs {}}}]
+    (binding [*timings* (atom [])]
+      (let [wall-start (System/nanoTime)]
+        (gen-build/gen-source-paths- args [(fs/->path src-dir)])
+        (let [wall-ms (/ (double (- (System/nanoTime) wall-start)) 1e6)
+              timings @*timings*]
+          {:wall-ms wall-ms
+           :timings timings
+           :summary (summarize-timings timings)})))))
+
 ;; -- Benchmark runners --------------------------------------------------------
 
 (defn bench-srcs
@@ -126,11 +174,14 @@
   "Run benchmark N times and print aggregate results.
   opts: same as gen-build srcs opts
   :iterations - number of runs (default 3)
-  :command - :srcs or :deps (default :srcs)
+  :command - :srcs, :deps, or :gen-source-paths (default :srcs)
   :warmup - number of warmup runs (default 1)"
   [{:keys [iterations command warmup] :or {iterations 3 command :srcs warmup 1} :as opts}]
   (let [bench-opts (dissoc opts :iterations :command :warmup)
-        bench-fn (case command :srcs bench-srcs :deps bench-deps)]
+        bench-fn (case command
+                   :srcs bench-srcs
+                   :deps bench-deps
+                   :gen-source-paths bench-gen-source-paths)]
     (install-instrumentation!)
     (try
       ;; Warmup
@@ -162,6 +213,41 @@
 
 ;; -- CLI entry point ----------------------------------------------------------
 
+(defn- bench-ab
+  "Run A/B test: with validation on vs off."
+  [opts]
+  (let [bench-opts (dissoc opts :iterations :command :warmup)
+        iterations 3]
+    (install-instrumentation!)
+    (try
+      ;; Warmup
+      (println "Warming up...")
+      (bench-gen-source-paths bench-opts)
+      (println "Warmup complete.\n")
+
+      ;; A: validation enabled
+      (println "=== A: Validation ENABLED ===")
+      (binding [gen-build/*enable-validation* true]
+        (let [results (doall
+                       (for [i (range iterations)]
+                         (let [r (bench-gen-source-paths bench-opts)]
+                           (println (format "  Run %d: %.1fms" (inc i) (:wall-ms r)))
+                           (:wall-ms r))))]
+          (println (format "  Mean: %.1fms\n" (/ (reduce + results) (count results))))))
+
+      ;; B: validation disabled (default)
+      (println "=== B: Validation DISABLED ===")
+      (let [results (doall
+                     (for [i (range iterations)]
+                       (let [r (bench-gen-source-paths bench-opts)]
+                         (println (format "  Run %d: %.1fms" (inc i) (:wall-ms r)))
+                         (:wall-ms r))))]
+        (println (format "  Mean: %.1fms\n" (/ (reduce + results) (count results)))))
+
+
+      (finally
+        (remove-instrumentation!)))))
+
 (defn -main [& args]
   (let [opts (apply hash-map args)
         opts (into {} (map (fn [[k v]] [(edn/read-string k) v]) opts))
@@ -179,5 +265,7 @@
                  (cond->
                      (System/getenv "BUILD_WORKSPACE_DIRECTORY")
                    (assoc :workspace-root (-> (System/getenv "BUILD_WORKSPACE_DIRECTORY") fs/->path))))]
-    (run-benchmark opts)
+    (if (= command :ab)
+      (bench-ab opts)
+      (run-benchmark opts))
     (shutdown-agents)))
