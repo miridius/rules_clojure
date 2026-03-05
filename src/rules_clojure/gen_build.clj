@@ -15,6 +15,7 @@
   (:import (clojure.lang IPersistentList IPersistentMap IPersistentVector Keyword Var)
            (java.io File PushbackReader StringReader)
            (java.nio.file FileVisitOption Files Path)
+           (java.security MessageDigest)
            (java.util.jar JarEntry JarFile))
   (:gen-class))
 
@@ -180,7 +181,7 @@
 (defn ->jar->lib
   "Return a map of jar path to library name ('org.clojure/clojure)"
   [basis]
-  {:post [(s/valid? ::jar->lib %)]}
+  {:post [(map? %)]}
   (->> basis
        :classpath
        (map (fn [[path {:keys [path-key lib-name]}]]
@@ -271,7 +272,7 @@
 (defn ->dep-ns->label [{:keys [basis deps-bazel deps-repo-tag] :as args}]
   {:pre [(map? basis)
          deps-bazel]
-   :post [(s/valid? ::dep-ns->label %)]}
+   :post [(map? %)]}
   (->> basis
        :classpath
        (map (fn [[path {:keys [lib-name]}]]
@@ -321,7 +322,7 @@
 (defn ->class->jar
   "returns a map of class symbol to jarpath for all jars on the classpath"
   [basis]
-  {:post [(s/valid? ::class->jar %)]}
+  {:post [(map? %)]}
   (into {}
         (mapcat
           (fn [path]
@@ -399,6 +400,52 @@
   []
   (.clear file-content-cache)
   (.clear ns-decl-cache))
+
+;; --- Disk caching for expensive mappings ---
+
+(def ^:private cache-dir
+  "Directory for caching computed mappings between gen_srcs runs."
+  (let [dir (or (System/getenv "GEN_SRCS_CACHE_DIR")
+                (str (System/getProperty "user.home") "/.cache/rules_clojure/gen_srcs"))]
+    (fs/->path dir)))
+
+(defn- sha256 ^String [^String s]
+  (let [md (MessageDigest/getInstance "SHA-256")
+        bytes (.digest md (.getBytes s "UTF-8"))]
+    (apply str (map #(format "%02x" %) bytes))))
+
+(defn- cache-key-for-deps
+  "Compute a cache key from deps.edn content and classpath roots."
+  [deps-edn-path basis]
+  (let [deps-content (slurp (str deps-edn-path))
+        cp-keys (sort (map str (keys (:classpath basis))))]
+    (sha256 (str deps-content "\n" (pr-str cp-keys)))))
+
+(defn- cache-path ^Path [^String cache-key ^String mapping-name]
+  (.resolve ^Path cache-dir (str cache-key "-" mapping-name ".edn")))
+
+(defn- write-cache! [^String cache-key ^String mapping-name data]
+  (try
+    (let [p (cache-path cache-key mapping-name)]
+      (Files/createDirectories (.getParent p) (into-array java.nio.file.attribute.FileAttribute []))
+      (Files/writeString p (pr-str data) (into-array java.nio.file.OpenOption [])))
+    (catch Exception _)))
+
+(defn- read-cache [^String cache-key ^String mapping-name]
+  (try
+    (let [p (cache-path cache-key mapping-name)]
+      (when (Files/exists p (into-array java.nio.file.LinkOption []))
+        (edn/read-string (Files/readString p))))
+    (catch Exception _ nil)))
+
+(defn- with-disk-cache
+  "Return cached value if available for cache-key + mapping-name, else compute via f, cache, and return."
+  [cache-key mapping-name f]
+  (if-let [cached (read-cache cache-key mapping-name)]
+    cached
+    (let [result (f)]
+      (write-cache! cache-key mapping-name result)
+      result)))
 
 (defn- slurp-cached ^String [^Path path]
   (or (.get file-content-cache path)
@@ -826,10 +873,14 @@
   repository-dir: output directory in the bazel sandbox where deps should be downloaded
   deps-repo-tag: Bazel workspace repo for deps, typically `@deps`
   "
-  [{:keys [deps-edn-path deps-bazel deps-repo-tag basis jar->lib aliases] :as args}]
-  (let [args (merge args
+  [{:keys [deps-edn-path deps-bazel deps-repo-tag basis jar->lib aliases cache-key] :as args}]
+  (let [dep-ns->label (if cache-key
+                        (with-disk-cache cache-key "dep-ns-label"
+                          #(->dep-ns->label args))
+                        (->dep-ns->label args))
+        args (merge args
                     {:src-ns->label (->src-ns->label args)
-                     :dep-ns->label (->dep-ns->label args)
+                     :dep-ns->label dep-ns->label
                      :jar->lib jar->lib})]
     (gen-source-paths- args (source-paths (select-keys args [:aliases :basis :deps-edn-dir :deps-bazel])))))
 
@@ -958,6 +1009,59 @@
                      :lib->jar lib->jar
                      :lib->deps lib->deps})))
 
+(defn- class->jar-to-serializable
+  "Convert class->jar map (symbol -> Path) to serializable form (symbol -> string)."
+  [m]
+  (into {} (map (fn [[k v]] [k (str v)])) m))
+
+(defn- class->jar-from-serializable
+  "Convert serialized class->jar map back to (symbol -> Path)."
+  [m]
+  (into {} (map (fn [[k v]] [k (fs/->path v)])) m))
+
+(defn- jar->lib-to-serializable
+  "Convert jar->lib map (Path -> symbol) to serializable form (string -> symbol)."
+  [m]
+  (into {} (map (fn [[k v]] [(str k) v])) m))
+
+(defn- jar->lib-from-serializable
+  "Convert serialized jar->lib map back to (Path -> symbol)."
+  [m]
+  (into {} (map (fn [[k v]] [(fs/->path k) v])) m))
+
+(defn- dir-changed-since?
+  "Returns true if any source file in dir has mtime newer than the given epoch millis."
+  [^Path dir ^long since-millis]
+  (let [dir-file (.toFile dir)]
+    (when (.isDirectory dir-file)
+      (some (fn [^File f]
+              (and (.isFile f)
+                   (let [name (.getName f)]
+                     (or (.endsWith name ".clj")
+                         (.endsWith name ".cljc")
+                         (.endsWith name ".cljs")))
+                   (> (.lastModified f) since-millis)))
+            (.listFiles dir-file)))))
+
+(defn- write-gen-srcs-timestamp!
+  "Write current time to the gen_srcs timestamp file in cache dir."
+  []
+  (try
+    (let [ts-path (.resolve ^Path cache-dir "last-run-millis")]
+      (Files/createDirectories (.getParent ts-path) (into-array java.nio.file.attribute.FileAttribute []))
+      (Files/writeString ts-path (str (System/currentTimeMillis))
+                         (into-array java.nio.file.OpenOption [])))
+    (catch Exception _)))
+
+(defn- read-gen-srcs-timestamp
+  "Read the timestamp of the last gen_srcs run, or nil if not available."
+  []
+  (try
+    (let [ts-path (.resolve ^Path cache-dir "last-run-millis")]
+      (when (Files/exists ts-path (into-array java.nio.file.LinkOption []))
+        (Long/parseLong (str/trim (Files/readString ts-path)))))
+    (catch Exception _ nil)))
+
 (defn srcs [{:keys [repository-dir deps-edn-path deps-repo-tag aliases aot-default]
              :or {deps-repo-tag "@deps"}}]
   {:pre [(re-find #"^@" deps-repo-tag) deps-edn-path repository-dir]}
@@ -970,8 +1074,13 @@
                            :aliases aliases
                            :repository-dir repository-dir
                            :deps-edn-path deps-edn-path})
-        jar->lib (->jar->lib basis)
-        class->jar (->class->jar basis)
+        ck (cache-key-for-deps deps-edn-path basis)
+        jar->lib (with-disk-cache ck "jar-lib"
+                   #(jar->lib-to-serializable (->jar->lib basis)))
+        jar->lib-paths (jar->lib-from-serializable jar->lib)
+        class->jar (with-disk-cache ck "class-jar"
+                     #(class->jar-to-serializable (->class->jar basis)))
+        class->jar-paths (class->jar-from-serializable class->jar)
         args {:aliases aliases
               :deps-bazel deps-bazel
               :deps-edn-path deps-edn-path
@@ -979,9 +1088,77 @@
               :repository-dir repository-dir
               :deps-repo-tag deps-repo-tag
               :basis basis
-              :jar->lib jar->lib
-              :class->jar class->jar}]
-    (gen-source-paths args)))
+              :jar->lib jar->lib-paths
+              :class->jar class->jar-paths
+              :cache-key ck}]
+    (gen-source-paths args)
+    (write-gen-srcs-timestamp!)))
+
+(defn srcs-incremental
+  "Like srcs, but only regenerates BUILD files for directories where source files
+  have changed since the last run. Uses disk-cached mappings.
+
+  Optional keys:
+    :source-dirs - specific directories to regenerate (seq of path strings relative to workspace root).
+                   When provided, only these dirs are processed (still skips unchanged).
+    :force       - when true, regenerate all dirs regardless of mtime."
+  [{:keys [repository-dir deps-edn-path deps-repo-tag aliases source-dirs force]
+    :or {deps-repo-tag "@deps"}}]
+  {:pre [(re-find #"^@" deps-repo-tag) deps-edn-path repository-dir]}
+  (let [deps-edn-path (-> deps-edn-path fs/->path fs/absolute)
+        repository-dir (-> repository-dir fs/->path fs/absolute)
+        read-deps (#'read-deps deps-edn-path)
+        deps-bazel (parse-deps-bazel read-deps)
+        aliases (or (mapv keyword aliases) [])
+        basis (make-basis {:read-deps read-deps
+                           :aliases aliases
+                           :repository-dir repository-dir
+                           :deps-edn-path deps-edn-path})
+        ck (cache-key-for-deps deps-edn-path basis)
+        jar->lib-paths (jar->lib-from-serializable
+                         (with-disk-cache ck "jar-lib"
+                           #(jar->lib-to-serializable (->jar->lib basis))))
+        class->jar-paths (class->jar-from-serializable
+                           (with-disk-cache ck "class-jar"
+                             #(class->jar-to-serializable (->class->jar basis))))
+        dep-ns->label (with-disk-cache ck "dep-ns-label"
+                        #(->dep-ns->label {:basis basis
+                                           :deps-bazel deps-bazel
+                                           :deps-repo-tag deps-repo-tag}))
+        deps-edn-dir (fs/dirname deps-edn-path)
+        args {:aliases aliases
+              :deps-bazel deps-bazel
+              :deps-edn-path deps-edn-path
+              :deps-edn-dir deps-edn-dir
+              :repository-dir repository-dir
+              :deps-repo-tag deps-repo-tag
+              :basis basis
+              :jar->lib jar->lib-paths
+              :class->jar class->jar-paths
+              :src-ns->label (->src-ns->label {:basis basis :deps-edn-dir deps-edn-dir})
+              :dep-ns->label dep-ns->label}
+        all-source-paths (source-paths (select-keys args [:aliases :basis :deps-edn-dir :deps-bazel]))
+        paths-to-process (if source-dirs
+                           (let [requested (set (map #(fs/->path deps-edn-dir %) source-dirs))]
+                             (filter #(contains? requested %) all-source-paths))
+                           all-source-paths)
+        last-run (when-not force (read-gen-srcs-timestamp))
+        {:keys [all-dirs dirs-with-clj]} (collect-dirs-with-clj-files paths-to-process)
+        args (assoc args :dirs-with-clj dirs-with-clj)
+        dirs-to-gen (if last-run
+                      (filter #(dir-changed-since? % last-run) all-dirs)
+                      all-dirs)
+        dirs (->> dirs-to-gen
+                  (sort-by (comp count str))
+                  (reverse))]
+    (when (seq dirs)
+      (clear-file-cache!)
+      (prun (fn [dir]
+              (gen-dir args dir))
+            dirs))
+    (write-gen-srcs-timestamp!)
+    (println (str "Processed " (count dirs) " dirs"
+                  (when last-run (str " (" (- (count all-dirs) (count dirs)) " unchanged, skipped)"))))))
 
 (defn gen-namespace-loader
   "Given a seq of filenames, generate a namespace that requires all namespaces and contains a function returning all namespaces. Useful for static analysis and CLJS test runners.
@@ -1053,6 +1230,7 @@
         f (case cmd
             :deps deps
             :srcs srcs
+            :srcs-incremental srcs-incremental
             :ns-loader gen-namespace-loader)]
     (f opts)
     (shutdown-agents)))

@@ -132,7 +132,11 @@ java_binary(name="worker",
 java_binary(name="gen_build",
             main_class="rules_clojure.gen_build",
             runtime_deps=[":libgen_build"],
-            jvm_flags = ["-Xmx2g", "-XX:MaxMetaspaceSize=500m"])
+            jvm_flags = ["-Xmx2g", "-XX:MaxMetaspaceSize=500m",
+                         "-XX:TieredStopAtLevel=1",
+                         "-XX:+UseSerialGC",
+                         "-Dclojure.spec.skip-macros=true",
+                         "-Dclojure.compiler.direct-linking=true"])
 
 java_library(name="srcjar",
              resources=glob(["*.clj"]),
