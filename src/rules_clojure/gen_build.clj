@@ -14,7 +14,8 @@
             [rules-clojure.namespace.parse :as parse])
   (:import (clojure.lang IPersistentList IPersistentMap IPersistentVector Keyword Var)
            (java.io File PushbackReader StringReader)
-           (java.nio.file FileVisitOption Files Path)
+           (java.nio.file FileVisitOption FileVisitResult Files Path SimpleFileVisitor)
+           (java.nio.file.attribute BasicFileAttributes)
            (java.security MessageDigest)
            (java.util.jar JarEntry JarFile))
   (:gen-class))
@@ -779,35 +780,43 @@
         (.endsWith s ".js"))))
 
 (defn- collect-dirs-with-clj-files
-  "Walk source paths once using java.nio Files/walk, returning:
+  "Walk source paths using Files/walkFileTree (which provides file attributes
+  during traversal, avoiding extra stat calls), returning:
    {:all-dirs   - set of all directories containing clj/cljc/cljs/js files
     :dirs-with-clj - set of directories that transitively contain clj files (for clj-subdirs check)
-    :source-files  - vector of all source file paths found}"
-  [paths]
-  (let [source-files (java.util.ArrayList.)
-        dirs-with-files (java.util.HashSet.)
-        _ (doseq [path paths]
-            (when (-> ^Path path .toFile .isDirectory)
-              (let [stream (Files/walk ^Path path (into-array FileVisitOption []))]
-                (try
-                  (.. stream
-                      (forEach (reify java.util.function.Consumer
-                                 (accept [_ p]
-                                   (when (source-file-path? ^Path p)
-                                     (.add source-files p)
-                                     (.add dirs-with-files (.getParent ^Path p)))))))
-                  (finally
-                    (.close stream))))))
-        ;; For clj-subdirs check: propagate up from dirs-with-files to all ancestors
-        dirs-with-clj (let [result (java.util.HashSet. dirs-with-files)]
-                        (doseq [^Path dir dirs-with-files]
-                          (loop [d (.getParent dir)]
-                            (when (and d (.add result d))
-                              (recur (.getParent d)))))
-                        result)]
-    {:all-dirs (set dirs-with-files)
-     :dirs-with-clj (set dirs-with-clj)
-     :source-files (vec source-files)}))
+    :source-files  - vector of all source file paths found}
+  When since-millis is provided, also returns :changed-dirs — the set of dirs
+  containing source files modified after that timestamp."
+  ([paths] (collect-dirs-with-clj-files paths nil))
+  ([paths since-millis]
+   (let [source-files (java.util.ArrayList.)
+         dirs-with-files (java.util.HashSet.)
+         changed-dirs (when since-millis (java.util.HashSet.))
+         since-ms (long (or since-millis 0))
+         _ (doseq [path paths]
+             (when (-> ^Path path .toFile .isDirectory)
+               (Files/walkFileTree ^Path path
+                 (proxy [SimpleFileVisitor] []
+                   (visitFile [^Path p ^BasicFileAttributes attrs]
+                     (when (source-file-path? p)
+                       (let [parent (.getParent p)]
+                         (.add source-files p)
+                         (.add dirs-with-files parent)
+                         (when (and changed-dirs
+                                    (> (.toMillis (.lastModifiedTime attrs)) since-ms))
+                           (.add ^java.util.HashSet changed-dirs parent))))
+                     FileVisitResult/CONTINUE)))))
+         ;; For clj-subdirs check: propagate up from dirs-with-files to all ancestors
+         dirs-with-clj (let [result (java.util.HashSet. dirs-with-files)]
+                         (doseq [^Path dir dirs-with-files]
+                           (loop [d (.getParent dir)]
+                             (when (and d (.add result d))
+                               (recur (.getParent d)))))
+                         result)]
+     (cond-> {:all-dirs (set dirs-with-files)
+              :dirs-with-clj (set dirs-with-clj)
+              :source-files (vec source-files)}
+       changed-dirs (assoc :changed-dirs (set changed-dirs))))))
 
 (s/fdef gen-source-paths- :args (s/cat :a (s/keys :req-un [::deps-edn-dir ::src-ns->label ::dep-ns->label ::jar->lib ::deps-repo-tag ::deps-bazel]) :paths (s/coll-of fs/path?)))
 (defn gen-source-paths-
@@ -1029,19 +1038,6 @@
   [m]
   (into {} (map (fn [[k v]] [(fs/->path k) v])) m))
 
-(defn- dir-changed-since?
-  "Returns true if any source file in dir has mtime newer than the given epoch millis."
-  [^Path dir ^long since-millis]
-  (let [dir-file (.toFile dir)]
-    (when (.isDirectory dir-file)
-      (some (fn [^File f]
-              (and (.isFile f)
-                   (let [name (.getName f)]
-                     (or (.endsWith name ".clj")
-                         (.endsWith name ".cljc")
-                         (.endsWith name ".cljs")))
-                   (> (.lastModified f) since-millis)))
-            (.listFiles dir-file)))))
 
 (defn- write-gen-srcs-timestamp!
   "Write current time to the gen_srcs timestamp file in cache dir."
@@ -1143,10 +1139,10 @@
                              (filter #(contains? requested %) all-source-paths))
                            all-source-paths)
         last-run (when-not force (read-gen-srcs-timestamp))
-        {:keys [all-dirs dirs-with-clj]} (collect-dirs-with-clj-files paths-to-process)
+        {:keys [all-dirs dirs-with-clj changed-dirs]} (collect-dirs-with-clj-files paths-to-process last-run)
         args (assoc args :dirs-with-clj dirs-with-clj)
         dirs-to-gen (if last-run
-                      (filter #(dir-changed-since? % last-run) all-dirs)
+                      (or changed-dirs all-dirs)
                       all-dirs)
         dirs (->> dirs-to-gen
                   (sort-by (comp count str))
